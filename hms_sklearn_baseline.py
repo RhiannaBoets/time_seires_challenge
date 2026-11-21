@@ -19,17 +19,17 @@ Usage:
 
 Requires: numpy, pandas, pyarrow, scikit-learn, joblib.
 """
-import argparse
+import argparse #instellingen meegeven via terminal
 import time
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GroupKFold
+from joblib import Parallel, delayed    #parallel processing
+from sklearn.ensemble import HistGradientBoostingClassifier #meerdere eenvoudige modellen (meestal beslisbomen) na elkaar opbouwt om nauwkeurige voorspellingen te maken voor regressie en classificatie
+from sklearn.linear_model import LogisticRegression #klassieke lineaire classificatie, waarbij de kans op een bepaalde klasse wordt gemodelleerd als een logistische functie van de inputkenmerken
+from sklearn.model_selection import GroupKFold  #verdeelt de dataset in K-folds, waarbij de gegevens worden gegroepeerd op basis van een bepaalde kolom (bijvoorbeeld patient_id) om te voorkomen dat gegevens van dezelfde groep in zowel de trainings- als validatiesets terechtkomen
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -60,9 +60,9 @@ def load_labels(data_dir, max_specs=None, seed=42):
     # Convert vote counts into a probability distribution (each row sums to 1).
     df["num_votes"] = df[CLASSES].sum(axis=1)
     df[CLASSES] = df[CLASSES].values / df["num_votes"].values[:, None]
-    df = df.reset_index()
+    df = df.reset_index()   # soft labels, een kans in plaats van een harde label (0 of 1) voor elke EEG
 
-    # Quick mode: keep only the EEGs of a random subset of spectrograms.
+    # Quick mode: keep only the EEGs of a random subset of spectrograms. Een kleinere data set selecteren voor snellere tests. De random_state zorgt ervoor dat dezelfde subset wordt geselecteerd bij herhaalde runs.
     if max_specs:
         keep = pd.Series(df.spectrogram_id.unique()).sample(n=min(max_specs, df.spectrogram_id.nunique()),
                                                              random_state=seed)
@@ -71,17 +71,17 @@ def load_labels(data_dir, max_specs=None, seed=42):
 
 
 # ----------------------------------------------------------------------------- features
-def band_columns(columns):
+def band_columns(columns):  #dit zijn de power kolommen van de spectrogrammen, die de frequentiebanden representeren
     """Return {(region, band): [column indices]} for the 400 spectrogram columns like 'LL_1.17'."""
     out = {}
     for r in REGIONS:
         for b, (lo, hi) in BANDS.items():
             out[(r, b)] = [i for i, c in enumerate(columns)
                            if c.startswith(r + "_") and lo <= float(c.split("_")[1]) < hi]
-    return out
+    return out  #voor vier regio's en vier frequentiebanden worden de kolomindices van de spectrogrammen teruggegeven
 
 
-def window_features(spec, cols):
+def window_features(spec, cols): #hier worden de 44 kolommen van de spectrogrammen samengevoegd tot 88 features per EEG. De features zijn gebaseerd op de logaritmische band power, de relatieve band power en de asymmetrie tussen de linker- en rechterhersenhelft.
     """Compute the 88 features for one 10-minute window.
 
     spec: float array of shape (time steps, 400 power columns).
@@ -92,22 +92,24 @@ def window_features(spec, cols):
     band_power = {}
     for (r, b), idx in cols.items():
         p = np.nanmean(spec[:, idx], axis=1)                     # mean power in the band, per time step
-        lp = np.log1p(np.nan_to_num(p, nan=0.0).clip(min=0))     # log scale; missing values -> 0
-        feats[f"{r}_{b}_mean"] = lp.mean()
-        feats[f"{r}_{b}_std"] = lp.std()
-        feats[f"{r}_{b}_min"] = lp.min()
-        feats[f"{r}_{b}_max"] = lp.max()
+        lp = np.log1p(np.nan_to_num(p, nan=0.0).clip(min=0))     # log scale; missing values -> 0, vervangt ontbrekende waarden door 0, voorkomt negatieve powerwaarden en voert logarithmische transformatie uit
+                                                                 # logtransformatie maakt grote verschillen in powerwaarden beter hanteerbaar en kan helpen bij het identificeren van patronen in de data
+        feats[f"{r}_{b}_mean"] = lp.mean()  #gemiddelde activiteit in de frequentieband over de tijd
+        feats[f"{r}_{b}_std"] = lp.std()    #hoeveel de activiteit in de frequentieband varieert over de tijd
+        feats[f"{r}_{b}_min"] = lp.min()    #laagst gemeten activiteit in de frequentieband over de tijd
+        feats[f"{r}_{b}_max"] = lp.max()    #hoogst gemeten activiteit in de frequentieband over de tijd
         band_power[(r, b)] = np.nanmean(p) if np.isfinite(p).any() else 0.0
         total[r] += band_power[(r, b)]
     for (r, b), v in band_power.items():                         # share of the region's total power
-        feats[f"{r}_{b}_rel"] = v / (total[r] + 1e-6)
-    for b in BANDS:                                              # left minus right hemisphere
+        feats[f"{r}_{b}_rel"] = v / (total[r] + 1e-6)           #relatieve band power: de verhouding van de power in een specifieke frequentieband tot de totale power in die regio, met een kleine constante toegevoegd om deling door nul te voorkomen
+    for b in BANDS:                                              # left minus right hemisphere, vergelijkt de activiteit in de linker- en rechterhersenhelft voor elke frequentieband
         feats[f"asym_lat_{b}"] = feats[f"LL_{b}_mean"] - feats[f"RL_{b}_mean"]
         feats[f"asym_par_{b}"] = feats[f"LP_{b}_mean"] - feats[f"RP_{b}_mean"]
     return feats
 
+#verliezen we informatie door het spectogram te comprimeren tot 88 features? Ja, maar het is een trade-off tussen informatierijkdom en modelcomplexiteit. Het gebruik van samengevoegde features kan helpen bij het verminderen van ruis en overfitting, terwijl het nog steeds belangrijke patronen in de data behoudt.
 
-def spectrogram_features(path, windows, is_test):
+def spectrogram_features(path, windows, is_test): 
     """Read one spectrogram file and compute features for every EEG that uses it.
 
     windows: list of (eeg_id, off_min, off_max); offsets are the label positions in seconds.
@@ -129,9 +131,10 @@ def spectrogram_features(path, windows, is_test):
         feats["eeg_id"] = eeg_id
         rows.append(feats)
     return rows
+#Wat is het verschil tussen de training en test spectrogrammen? Training spectrogrammen bevatten gegevens over het hele EEG-signaal, terwijl test spectrogrammen korter zijn en zich richten op een specifiek segment van het signaal. Dit verschil beïnvloedt hoe de functies worden berekend, met name de selectie van het tijdvenster voor feature-extractie.
 
 
-def build_features(meta, spec_dir, is_test=False, n_jobs=-1):
+def build_features(meta, spec_dir, is_test=False, n_jobs=-1): #n_jobs=-1 betekent dat alle beschikbare CPU-kernen worden gebruikt voor parallelle verwerking. Dit kan de verwerkingstijd aanzienlijk verkorten, vooral bij grote datasets.
     """Compute features for all EEGs in `meta`, reading each spectrogram file once (in parallel)."""
     t0 = time.time()
     if is_test:   # test.csv has no label offsets
@@ -146,7 +149,7 @@ def build_features(meta, spec_dir, is_test=False, n_jobs=-1):
 
 
 # ----------------------------------------------------------------------------- models
-def kl_score(y_true, y_pred, eps=1e-15):
+def kl_score(y_true, y_pred, eps=1e-15):    #meet hoe verschillend de voorspelde kansverdeling is van de werkelijke verdeling. Een lagere KL-score duidt op een betere voorspelling.
     """Mean KL divergence KL(y_true || y_pred) over samples, as in the competition metric."""
     p = np.clip(y_pred, eps, 1)
     p = p / p.sum(axis=1, keepdims=True)
@@ -154,7 +157,7 @@ def kl_score(y_true, y_pred, eps=1e-15):
     return np.mean(np.sum(np.where(t > 0, t * np.log(np.where(t > 0, t, 1) / p), 0), axis=1))
 
 
-def expand(X, Y):
+def expand(X, Y): #scikit learn classifiers typically expect hard labels (one class per sample), but in this case, the labels are soft (probability distributions over classes). The expand function transforms the soft labels into a format suitable for training by repeating each sample for each class and assigning weights based on the soft label probabilities.
     """Turn soft labels into weighted hard labels.
 
     Each sample is repeated once per class (label = class index, weight = vote fraction);
@@ -166,25 +169,25 @@ def expand(X, Y):
     wr = Y.reshape(-1)
     keep = wr > 0
     return Xr[keep], yr[keep], wr[keep]
-
+#gewicht bepaalt hoeveel invloed een bepaald voorbeeld heeft op het leren van het model. Voorbeelden met hogere gewichten dragen meer bij aan de parameterupdates tijdens het trainen, terwijl voorbeelden met lagere gewichten minder invloed hebben. Dit is vooral belangrijk bij soft labels, omdat het model moet leren van de onzekerheid in de labels en niet alleen van harde beslissingen.
 
 def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
-        return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000))
+        return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
     return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
-                                          l2_regularization=1.0, random_state=seed)
+                                          l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
 MODEL_NAMES = ["logreg", "hgb"]
 
 
-def fit(name, X, Y, seed=42):
+def fit(name, X, Y, seed=42): #model trainen 
     """Fit model `name` on features X and soft labels Y (rows are vote distributions)."""
     Xe, ye, we = expand(X, Y)
-    m = make_model(name, seed)
+    m = make_model(name, seed)  #soft labels uitgebreid naar gewogen observaties
     if name == "logreg":   # in a Pipeline the weight must be routed to the final step
-        m.fit(Xe, ye, logisticregression__sample_weight=we)
+        m.fit(Xe, ye, logisticregression__sample_weight=we) #model leert relatie tussen de 88 features en de zes klassen, waarbij de gewichten aangeven hoe belangrijk elk voorbeeld is bij het leren van de parameters van het model
     else:
         m.fit(Xe, ye, sample_weight=we)
     return m
@@ -197,10 +200,10 @@ def to_matrix(frame, feats):
 
 def cross_validate(X, Y, groups, num_votes, n_folds, seed):
     """Patient-grouped K-fold CV for both models; prints scores and returns the better model's name."""
-    prior = np.tile(Y.mean(axis=0), (len(Y), 1))   # trivial reference: always predict the mean distribution
+    prior = np.tile(Y.mean(axis=0), (len(Y), 1))   # trivial reference: always predict the mean distribution. prior baseline berekend op basis van de gemiddelde verdeling van de klassen in de trainingsset. Het dient als een eenvoudige referentie om te vergelijken hoe goed de getrainde modellen presteren ten opzichte van een model dat altijd dezelfde voorspelling doet, namelijk de gemiddelde verdeling van de klassen.
     hi = num_votes >= 10                            # EEGs with at least 10 expert votes
     oof = {name: np.zeros_like(Y) for name in MODEL_NAMES}   # out-of-fold predictions per model
-    for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_folds).split(X, Y, groups)):
+    for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_folds).split(X, Y, groups)):  #hoe goed presteert het model op ongeziene data, waarbij de gegevens worden gegroepeerd op basis van patient_id om te voorkomen dat gegevens van dezelfde patiënt in zowel de trainings- als validatiesets terechtkomen
         for name in MODEL_NAMES:
             oof[name][va] = fit(name, X[tr], Y[tr], seed).predict_proba(X[va])
         print(f"fold {fold}: " + ", ".join(f"{n}={kl_score(Y[va], oof[n][va]):.4f}" for n in MODEL_NAMES))
@@ -242,11 +245,11 @@ def main():
         best = "hgb"
     else:
         best = cross_validate(X, Y, df["patient_id"].to_numpy(), df["num_votes"].to_numpy(),
-                              args.folds, args.seed)
+                              args.folds, args.seed)    #model met de laagste KL-score wordt gekozen als het beste model
     print("model for submission:", best)
 
     # 4. Refit on all training data and predict the test set
-    final = fit(best, X, Y, args.seed)
+    final = fit(best, X, Y, args.seed)  #gekozen model wordt opnieuw getraind op alle trainingsgegevens om de uiteindelijke voorspellingen te maken. nu de volledige trianingsset dus ook dubbele patienten en EEGs met minder dan 10 stemmen worden gebruikt om het model te trainen, zodat het kan profiteren van alle beschikbare informatie en mogelijk betere voorspellingen kan doen op de testset.
     test = pd.read_csv(args.data_dir / "test.csv")
     T_df = build_features(test, args.data_dir / "test_spectrograms", is_test=True, n_jobs=args.n_jobs)
     T_df = test[["eeg_id"]].merge(T_df, on="eeg_id", how="left")   # keep the order of test.csv
