@@ -35,6 +35,7 @@ from sklearn.model_selection import GroupKFold  #verdeelt de dataset in K-folds,
 from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
 
 # Some spectrograms contain frequency bands that are entirely NaN; numpy warns about the
 # resulting empty means. These cases are handled explicitly below, so the warnings are muted.
@@ -173,67 +174,23 @@ def expand(X, Y): #scikit learn classifiers typically expect hard labels (one cl
     return Xr[keep], yr[keep], wr[keep]
 #gewicht bepaalt hoeveel invloed een bepaald voorbeeld heeft op het leren van het model. Voorbeelden met hogere gewichten dragen meer bij aan de parameterupdates tijdens het trainen, terwijl voorbeelden met lagere gewichten minder invloed hebben. Dit is vooral belangrijk bij soft labels, omdat het model moet leren van de onzekerheid in de labels en niet alleen van harde beslissingen.
 
-class SoftLabelKNN:
-    def __init__(self, n_neighbors=5, n_components=50):
-        self.n_neighbors = n_neighbors
-        self.n_components = n_components
-
-    def fit(self, X, Y):
-        self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X)
-
-        if self.n_components is not None:
-            self.pca = PCA(n_components=self.n_components)
-            X_scaled = self.pca.fit_transform(X_scaled)
-
-        self.Y = Y.copy()
-
-        self.neighbors = NearestNeighbors(
-            n_neighbors=self.n_neighbors,
-            metric="euclidean"
-        )
-        self.neighbors.fit(X_scaled)
-
-        return self
-
-    def predict_proba(self, X):
-        X_scaled = self.scaler.transform(X)
-
-        if self.n_components is not None:
-            X_scaled = self.pca.transform(X_scaled)
-
-        distances, indices = self.neighbors.kneighbors(X_scaled)
-
-        weights = 1.0 / (distances + 1e-8)
-        weights = weights / weights.sum(axis=1, keepdims=True)
-
-        probabilities = np.sum(
-            self.Y[indices] * weights[:, :, None],
-            axis=1
-        )
-
-        return probabilities
-
 
 def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
         return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
-    
-    if name == "KNN":
-        return SoftLabelKNN(n_neighbors=5) 
+    if name == "RF":
+        return RandomForestClassifier(n_estimators=200, max_depth=10, min_samples_leaf=5, random_state=seed) #ensemble van beslisbomen die samen een robuuster model vormen. Elke boom wordt getraind op een willekeurige subset van de trainingsgegevens en maakt voorspellingen. De uiteindelijke voorspelling wordt bepaald door de meerderheid van de stemmen van alle bomen. De hyperparameters zoals n_estimators, max_depth en min_samples_leaf beïnvloeden de complexiteit en prestaties van het model.
     return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
-MODEL_NAMES = ["logreg", "KNN","hgb"]
+MODEL_NAMES = ["logreg", "RF","hgb"]
 
 
 def fit(name, X, Y, seed=42): #model trainen 
     """Fit model `name` on features X and soft labels Y (rows are vote distributions)."""
-    if name == "KNN":
-        return SoftLabelKNN(n_neighbors=5).fit(X, Y)
-    
+
     Xe, ye, we = expand(X, Y)
     m = make_model(name, seed)  #soft labels uitgebreid naar gewogen observaties
     if name == "logreg":   # in a Pipeline the weight must be routed to the final step
