@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed    #parallel processing
+from scipy.linalg import eigh  #eigenvalue decomposition, gebruikt om de eigenwaarden en eigenvectoren van een matrix te berekenen. In dit geval wordt het gebruikt om de generalised eigenvalue problem op te lossen bij het trainen van de Weighted Fisher's Discriminant Analysis (FDA) voor soft multi-class labels.    
 from sklearn.decomposition import PCA
 from sklearn.ensemble import HistGradientBoostingClassifier #meerdere eenvoudige modellen (meestal beslisbomen) na elkaar opbouwt om nauwkeurige voorspellingen te maken voor regressie en classificatie
 from sklearn.linear_model import LogisticRegression #klassieke lineaire classificatie, waarbij de kans op een bepaalde klasse wordt gemodelleerd als een logistische functie van de inputkenmerken
@@ -171,10 +172,102 @@ def expand(X, Y): #scikit learn classifiers typically expect hard labels (one cl
     return Xr[keep], yr[keep], wr[keep]
 #gewicht bepaalt hoeveel invloed een bepaald voorbeeld heeft op het leren van het model. Voorbeelden met hogere gewichten dragen meer bij aan de parameterupdates tijdens het trainen, terwijl voorbeelden met lagere gewichten minder invloed hebben. Dit is vooral belangrijk bij soft labels, omdat het model moet leren van de onzekerheid in de labels en niet alleen van harde beslissingen.
 
+class WeightedFDA:
+    """
+    Weighted Fisher's Discriminant Analysis for soft multi-class labels.
+    FDA is used for dimensionality reduction before Logistic Regression.
+    """
+
+    def __init__(self, n_components=5, ridge=1e-3):
+        self.n_components = n_components
+        self.ridge = ridge
+        self.W = None
+
+    def fit(self, X, Y):
+        """Fit FDA using soft class probabilities."""
+
+        n_samples, n_features = X.shape
+        n_classes = Y.shape[1]
+
+        # Standardise features.
+        self.scaler = StandardScaler()
+        X = self.scaler.fit_transform(X)
+
+        # Overall mean.
+        overall_mean = X.mean(axis=0)
+
+        # Initialise scatter matrices.
+        S_w = np.zeros((n_features, n_features))
+        S_b = np.zeros((n_features, n_features))
+
+        # Calculate class means and scatter matrices.
+        for c in range(n_classes):
+            weights = Y[:, c]
+            total_weight = weights.sum()
+
+            if total_weight <= 0:
+                continue
+
+            class_mean = np.average(
+                X, axis=0, weights=weights
+            )
+
+            # Within-class scatter.
+            centered = X - class_mean
+            S_w += (centered * weights[:, None]).T @ centered
+
+            # Between-class scatter.
+            mean_difference = class_mean - overall_mean
+            S_b += total_weight * np.outer(
+                mean_difference, mean_difference
+            )
+
+        # Regularise within-class scatter.
+        ridge_value = self.ridge * np.trace(S_w) / n_features
+        S_w += ridge_value * np.eye(n_features)
+
+        # Solve generalised eigenvalue problem.
+        eigvals, eigvecs = eigh(S_b, S_w)
+
+        # Select the largest eigenvalues.
+        order = np.argsort(eigvals)[::-1]
+        n_components = min(self.n_components, n_classes - 1, n_features)
+
+        self.W = eigvecs[:, order[:n_components]]
+
+        # Transform data.
+        X_fda = X @ self.W
+
+        # Train Logistic Regression using soft labels.
+        Xe, ye, we = expand(X_fda, Y)
+
+        self.classifier = LogisticRegression(
+            C=0.1,
+            max_iter=2000
+        )
+        self.classifier.fit(Xe, ye, sample_weight=we)
+
+        return self
+
+    def predict_proba(self, X):
+        """Predict class probabilities."""
+
+        X = self.scaler.transform(X)
+        X_fda = X @ self.W
+
+        probabilities = self.classifier.predict_proba(X_fda)
+
+        result = np.zeros((len(X), 6))
+        result[:, self.classifier.classes_.astype(int)] = probabilities
+
+        return result
+
+
+
 def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
-        return make_pipeline(StandardScaler(), PCA(n_components=60, random_state=seed), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
+        return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
     
     
     
@@ -182,11 +275,15 @@ def make_model(name, seed=42):
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
-MODEL_NAMES = ["logreg", "hgb"]
+MODEL_NAMES = ["logreg", "fda","hgb"]
 
 
 def fit(name, X, Y, seed=42): #model trainen 
     """Fit model `name` on features X and soft labels Y (rows are vote distributions)."""
+    if name == "fda":
+        m = WeightedFDA(n_components=5, ridge=1e-3)
+        m.fit(X, Y)
+        return m
     Xe, ye, we = expand(X, Y)
     m = make_model(name, seed)  #soft labels uitgebreid naar gewogen observaties
     if name == "logreg":   # in a Pipeline the weight must be routed to the final step
