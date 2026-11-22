@@ -32,6 +32,7 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import HistGradientBoostingClassifier #meerdere eenvoudige modellen (meestal beslisbomen) na elkaar opbouwt om nauwkeurige voorspellingen te maken voor regressie en classificatie
 from sklearn.linear_model import LogisticRegression #klassieke lineaire classificatie, waarbij de kans op een bepaalde klasse wordt gemodelleerd als een logistische functie van de inputkenmerken
 from sklearn.model_selection import GroupKFold  #verdeelt de dataset in K-folds, waarbij de gegevens worden gegroepeerd op basis van een bepaalde kolom (bijvoorbeeld patient_id) om te voorkomen dat gegevens van dezelfde groep in zowel de trainings- als validatiesets terechtkomen
+from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -172,22 +173,60 @@ def expand(X, Y): #scikit learn classifiers typically expect hard labels (one cl
     return Xr[keep], yr[keep], wr[keep]
 #gewicht bepaalt hoeveel invloed een bepaald voorbeeld heeft op het leren van het model. Voorbeelden met hogere gewichten dragen meer bij aan de parameterupdates tijdens het trainen, terwijl voorbeelden met lagere gewichten minder invloed hebben. Dit is vooral belangrijk bij soft labels, omdat het model moet leren van de onzekerheid in de labels en niet alleen van harde beslissingen.
 
+class SoftLabelKNN:
+    def __init__(self, n_neighbors=5):
+        self.n_neighbors = n_neighbors
+
+    def fit(self, X, Y):
+        self.scaler = StandardScaler()  #features standaardiseren door het gemiddelde en de standaarddeviatie van de trainingsgegevens te gebruiken. Dit helpt om de invloed van verschillende schalen van de features te verminderen en kan de prestaties van het KNN-model verbeteren.
+        X_scaled = self.scaler.fit_transform(X)
+
+        self.Y = Y.copy()   #soft labels worden opgeslagen voor gebruik bij het voorspellen van de waarschijnlijkheden van de klassen voor nieuwe voorbeelden. De Y-matrix bevat de kansverdelingen over de klassen voor elk trainingsvoorbeeld, en deze informatie wordt gebruikt om de voorspellingen van het KNN-model te berekenen op basis van de buren van een nieuw voorbeeld.
+
+        self.neighbors = NearestNeighbors(
+            n_neighbors=self.n_neighbors,
+            metric="euclidean"
+        )
+        self.neighbors.fit(X_scaled)
+
+        return self
+
+    def predict_proba(self, X):
+        X_scaled = self.scaler.transform(X)
+
+        distances, indices = self.neighbors.kneighbors(X_scaled)
+
+        weights = 1.0 / (distances + 1e-8)
+        weights = weights / weights.sum(axis=1, keepdims=True)
+
+        probabilities = np.sum(
+            self.Y[indices] * weights[:, :, None],
+            axis=1
+        )
+
+        return probabilities
+
+
 def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
         return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
     
+    if name == "KNN":
+        return KNeighborsClassifier(n_neighbors=5, weights='uniform') #KNN-classifier maakt voorspellingen op basis van de meest voorkomende klasse onder de k dichtstbijzijnde trainingsvoorbeelden. De parameter n_neighbors bepaalt het aantal buren dat wordt overwogen bij het maken van een voorspelling, terwijl de parameter weights bepaalt hoe de invloed van de buren wordt gewogen (bijvoorbeeld op basis van afstand).
     
-    
-    return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=15,
+    return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
-MODEL_NAMES = ["logreg","hgb"]
+MODEL_NAMES = ["logreg", "KNN","hgb"]
 
 
 def fit(name, X, Y, seed=42): #model trainen 
     """Fit model `name` on features X and soft labels Y (rows are vote distributions)."""
+    if name == "KNN":
+        return SoftLabelKNN(n_neighbors=5).fit(X, Y)
+    
     Xe, ye, we = expand(X, Y)
     m = make_model(name, seed)  #soft labels uitgebreid naar gewogen observaties
     if name == "logreg":   # in a Pipeline the weight must be routed to the final step
