@@ -174,7 +174,7 @@ def expand(X, Y): #scikit learn classifiers typically expect hard labels (one cl
 #gewicht bepaalt hoeveel invloed een bepaald voorbeeld heeft op het leren van het model. Voorbeelden met hogere gewichten dragen meer bij aan de parameterupdates tijdens het trainen, terwijl voorbeelden met lagere gewichten minder invloed hebben. Dit is vooral belangrijk bij soft labels, omdat het model moet leren van de onzekerheid in de labels en niet alleen van harde beslissingen.
 
 class SoftLabelKNN:
-    def __init__(self, n_neighbors=5, n_components=None):
+    def __init__(self, n_neighbors=5, n_components=50):
         self.n_neighbors = n_neighbors
         self.n_components = n_components
 
