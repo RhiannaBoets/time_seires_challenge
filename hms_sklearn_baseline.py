@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed    #parallel processing
+from sklearn.decomposition import PCA
 from sklearn.ensemble import HistGradientBoostingClassifier #meerdere eenvoudige modellen (meestal beslisbomen) na elkaar opbouwt om nauwkeurige voorspellingen te maken voor regressie en classificatie
 from sklearn.linear_model import LogisticRegression #klassieke lineaire classificatie, waarbij de kans op een bepaalde klasse wordt gemodelleerd als een logistische functie van de inputkenmerken
 from sklearn.model_selection import GroupKFold  #verdeelt de dataset in K-folds, waarbij de gegevens worden gegroepeerd op basis van een bepaalde kolom (bijvoorbeeld patient_id) om te voorkomen dat gegevens van dezelfde groep in zowel de trainings- als validatiesets terechtkomen
@@ -147,7 +148,6 @@ def build_features(meta, spec_dir, is_test=False, n_jobs=-1): #n_jobs=-1 beteken
     print(f"{len(jobs)} spectrograms -> {len(out)} feature rows in {time.time() - t0:.0f}s")
     return out
 
-
 # ----------------------------------------------------------------------------- models
 def kl_score(y_true, y_pred, eps=1e-15):    #meet hoe verschillend de voorspelde kansverdeling is van de werkelijke verdeling. Een lagere KL-score duidt op een betere voorspelling.
     """Mean KL divergence KL(y_true || y_pred) over samples, as in the competition metric."""
@@ -174,7 +174,10 @@ def expand(X, Y): #scikit learn classifiers typically expect hard labels (one cl
 def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
-        return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
+        return make_pipeline(StandardScaler(), PCA(n_components=60, random_state=seed), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
+    
+    
+    
     return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
