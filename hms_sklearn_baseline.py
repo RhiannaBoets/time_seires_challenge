@@ -37,6 +37,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 
 # Some spectrograms contain frequency bands that are entirely NaN; numpy warns about the
 # resulting empty means. These cases are handled explicitly below, so the warnings are muted.
@@ -180,14 +181,14 @@ def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
         return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
-    if name == "XGB":
-        return XGBClassifier(learning_rate=0.05, n_estimators=300, max_depth=6, subsample=0.8,
-                             colsample_bytree=0.8, random_state=seed) #bouwt een reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, n_estimators, max_depth, subsample en colsample_bytree beïnvloeden de complexiteit en prestaties van het model.
+    if name == "LGBM":
+        return LGBMClassifier(learning_rate=0.05, n_estimators=300, max_depth=6, subsample=0.8,
+                              colsample_bytree=0.8, random_state=seed) #bouwt een reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, n_estimators, max_depth, subsample en colsample_bytree beïnvloeden de complexiteit en prestaties van het model.
     return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
-MODEL_NAMES = ["logreg", "XGB","hgb"]
+MODEL_NAMES = ["logreg", "LGBM","hgb"]
 
 
 def fit(name, X, Y, seed=42): #model trainen 
