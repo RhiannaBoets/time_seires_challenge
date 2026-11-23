@@ -38,6 +38,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+import torch.optim as optim
+import torch.nn.functional as F
 
 # Some spectrograms contain frequency bands that are entirely NaN; numpy warns about the
 # resulting empty means. These cases are handled explicitly below, so the warnings are muted.
@@ -175,25 +180,111 @@ def expand(X, Y): #scikit learn classifiers typically expect hard labels (one cl
     keep = wr > 0
     return Xr[keep], yr[keep], wr[keep]
 #gewicht bepaalt hoeveel invloed een bepaald voorbeeld heeft op het leren van het model. Voorbeelden met hogere gewichten dragen meer bij aan de parameterupdates tijdens het trainen, terwijl voorbeelden met lagere gewichten minder invloed hebben. Dit is vooral belangrijk bij soft labels, omdat het model moet leren van de onzekerheid in de labels en niet alleen van harde beslissingen.
+class MLP(nn.Module):
+    def __init__(self, input_size=88, n_classes=6):
+        super().__init__()
 
+        self.network = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
 
+            nn.Linear(128, 64),
+            nn.ReLU(),
+
+            nn.Linear(64, n_classes)
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+class SoftLabelMLP:
+    def __init__(self, input_size=88, n_classes=6,
+                 lr=0.001, epochs=100, batch_size=32):
+
+        torch.manual_seed(42)
+        np.random.seed(42)
+
+        self.scaler = StandardScaler()
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+
+        self.model = MLP(input_size, n_classes)
+
+        self.criterion = nn.KLDivLoss(reduction="batchmean")
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.lr
+        )
+
+    def fit(self, X, Y):
+
+        X = self.scaler.fit_transform(X)
+
+        dataset = TensorDataset(
+            torch.tensor(X, dtype=torch.float32),
+            torch.tensor(Y, dtype=torch.float32)
+        )
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True
+        )
+
+        self.model.train()
+
+        for epoch in range(self.epochs):
+            for batch_X, batch_Y in dataloader:
+                self.optimizer.zero_grad()
+
+                outputs = F.log_softmax(self.model(batch_X), dim=1)
+                loss = self.criterion(outputs, batch_Y)
+
+                loss.backward()
+                self.optimizer.step()
+
+        return self
+
+    def predict_proba(self, X):
+        self.model.eval()
+
+        X = self.scaler.transform(X)
+        X = torch.tensor(X, dtype=torch.float32)
+
+        with torch.no_grad():
+            outputs = self.model(X)
+            probabilities = F.softmax(outputs, dim=1)
+
+        return probabilities.numpy()
+
+    
 def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
         return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
-    if name == "LGBM":
-        return LGBMClassifier(learning_rate=0.05, n_estimators=300, max_depth=6, subsample=0.8,
-                              colsample_bytree=0.8, random_state=seed) #bouwt een reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, n_estimators, max_depth, subsample en colsample_bytree beïnvloeden de complexiteit en prestaties van het model.
+
     return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
-MODEL_NAMES = ["logreg", "LGBM","hgb"]
+MODEL_NAMES = ["logreg", "mlp", "hgb"]
 
 
 def fit(name, X, Y, seed=42): #model trainen 
     """Fit model `name` on features X and soft labels Y (rows are vote distributions)."""
-
+    
+    if name == "mlp":
+        model = SoftLabelMLP(
+    input_size=X.shape[1],
+    n_classes=Y.shape[1],
+    lr=0.001,
+    epochs=100,
+    batch_size=32
+)
+        model.fit(X, Y)
+        return model
+    
     Xe, ye, we = expand(X, Y)
     m = make_model(name, seed)  #soft labels uitgebreid naar gewogen observaties
     if name == "logreg":   # in a Pipeline the weight must be routed to the final step
