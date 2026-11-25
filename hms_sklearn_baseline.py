@@ -19,30 +19,25 @@ Usage:
 
 Requires: numpy, pandas, pyarrow, scikit-learn, joblib.
 """
-import argparse #instellingen meegeven via terminal
+import argparse
 import time
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed    #parallel processing
-from scipy.linalg import eigh  #eigenvalue decomposition, gebruikt om de eigenwaarden en eigenvectoren van een matrix te berekenen. In dit geval wordt het gebruikt om de generalised eigenvalue problem op te lossen bij het trainen van de Weighted Fisher's Discriminant Analysis (FDA) voor soft multi-class labels.    
-from sklearn.decomposition import PCA
-from sklearn.ensemble import HistGradientBoostingClassifier #meerdere eenvoudige modellen (meestal beslisbomen) na elkaar opbouwt om nauwkeurige voorspellingen te maken voor regressie en classificatie
-from sklearn.linear_model import LogisticRegression #klassieke lineaire classificatie, waarbij de kans op een bepaalde klasse wordt gemodelleerd als een logistische functie van de inputkenmerken
-from sklearn.model_selection import GroupKFold  #verdeelt de dataset in K-folds, waarbij de gegevens worden gegroepeerd op basis van een bepaalde kolom (bijvoorbeeld patient_id) om te voorkomen dat gegevens van dezelfde groep in zowel de trainings- als validatiesets terechtkomen
-from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
+from joblib import Parallel, delayed
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
+
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-import torch.optim as optim
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from collections import OrderedDict
 
 # Some spectrograms contain frequency bands that are entirely NaN; numpy warns about the
 # resulting empty means. These cases are handled explicitly below, so the warnings are muted.
@@ -71,9 +66,9 @@ def load_labels(data_dir, max_specs=None, seed=42):
     # Convert vote counts into a probability distribution (each row sums to 1).
     df["num_votes"] = df[CLASSES].sum(axis=1)
     df[CLASSES] = df[CLASSES].values / df["num_votes"].values[:, None]
-    df = df.reset_index()   # soft labels, een kans in plaats van een harde label (0 of 1) voor elke EEG
+    df = df.reset_index()
 
-    # Quick mode: keep only the EEGs of a random subset of spectrograms. Een kleinere data set selecteren voor snellere tests. De random_state zorgt ervoor dat dezelfde subset wordt geselecteerd bij herhaalde runs.
+    # Quick mode: keep only the EEGs of a random subset of spectrograms.
     if max_specs:
         keep = pd.Series(df.spectrogram_id.unique()).sample(n=min(max_specs, df.spectrogram_id.nunique()),
                                                              random_state=seed)
@@ -82,17 +77,17 @@ def load_labels(data_dir, max_specs=None, seed=42):
 
 
 # ----------------------------------------------------------------------------- features
-def band_columns(columns):  #dit zijn de power kolommen van de spectrogrammen, die de frequentiebanden representeren
+def band_columns(columns):
     """Return {(region, band): [column indices]} for the 400 spectrogram columns like 'LL_1.17'."""
     out = {}
     for r in REGIONS:
         for b, (lo, hi) in BANDS.items():
             out[(r, b)] = [i for i, c in enumerate(columns)
                            if c.startswith(r + "_") and lo <= float(c.split("_")[1]) < hi]
-    return out  #voor vier regio's en vier frequentiebanden worden de kolomindices van de spectrogrammen teruggegeven
+    return out
 
 
-def window_features(spec, cols): #hier worden de 44 kolommen van de spectrogrammen samengevoegd tot 88 features per EEG. De features zijn gebaseerd op de logaritmische band power, de relatieve band power en de asymmetrie tussen de linker- en rechterhersenhelft.
+def window_features(spec, cols):
     """Compute the 88 features for one 10-minute window.
 
     spec: float array of shape (time steps, 400 power columns).
@@ -103,24 +98,22 @@ def window_features(spec, cols): #hier worden de 44 kolommen van de spectrogramm
     band_power = {}
     for (r, b), idx in cols.items():
         p = np.nanmean(spec[:, idx], axis=1)                     # mean power in the band, per time step
-        lp = np.log1p(np.nan_to_num(p, nan=0.0).clip(min=0))     # log scale; missing values -> 0, vervangt ontbrekende waarden door 0, voorkomt negatieve powerwaarden en voert logarithmische transformatie uit
-                                                                 # logtransformatie maakt grote verschillen in powerwaarden beter hanteerbaar en kan helpen bij het identificeren van patronen in de data
-        feats[f"{r}_{b}_mean"] = lp.mean()  #gemiddelde activiteit in de frequentieband over de tijd
-        feats[f"{r}_{b}_std"] = lp.std()    #hoeveel de activiteit in de frequentieband varieert over de tijd
-        feats[f"{r}_{b}_min"] = lp.min()    #laagst gemeten activiteit in de frequentieband over de tijd
-        feats[f"{r}_{b}_max"] = lp.max()    #hoogst gemeten activiteit in de frequentieband over de tijd
+        lp = np.log1p(np.nan_to_num(p, nan=0.0).clip(min=0))     # log scale; missing values -> 0
+        feats[f"{r}_{b}_mean"] = lp.mean()
+        feats[f"{r}_{b}_std"] = lp.std()
+        feats[f"{r}_{b}_min"] = lp.min()
+        feats[f"{r}_{b}_max"] = lp.max()
         band_power[(r, b)] = np.nanmean(p) if np.isfinite(p).any() else 0.0
         total[r] += band_power[(r, b)]
     for (r, b), v in band_power.items():                         # share of the region's total power
-        feats[f"{r}_{b}_rel"] = v / (total[r] + 1e-6)           #relatieve band power: de verhouding van de power in een specifieke frequentieband tot de totale power in die regio, met een kleine constante toegevoegd om deling door nul te voorkomen
-    for b in BANDS:                                              # left minus right hemisphere, vergelijkt de activiteit in de linker- en rechterhersenhelft voor elke frequentieband
+        feats[f"{r}_{b}_rel"] = v / (total[r] + 1e-6)
+    for b in BANDS:                                              # left minus right hemisphere
         feats[f"asym_lat_{b}"] = feats[f"LL_{b}_mean"] - feats[f"RL_{b}_mean"]
         feats[f"asym_par_{b}"] = feats[f"LP_{b}_mean"] - feats[f"RP_{b}_mean"]
     return feats
 
-#verliezen we informatie door het spectogram te comprimeren tot 88 features? Ja, maar het is een trade-off tussen informatierijkdom en modelcomplexiteit. Het gebruik van samengevoegde features kan helpen bij het verminderen van ruis en overfitting, terwijl het nog steeds belangrijke patronen in de data behoudt.
 
-def spectrogram_features(path, windows, is_test): 
+def spectrogram_features(path, windows, is_test):
     """Read one spectrogram file and compute features for every EEG that uses it.
 
     windows: list of (eeg_id, off_min, off_max); offsets are the label positions in seconds.
@@ -142,10 +135,9 @@ def spectrogram_features(path, windows, is_test):
         feats["eeg_id"] = eeg_id
         rows.append(feats)
     return rows
-#Wat is het verschil tussen de training en test spectrogrammen? Training spectrogrammen bevatten gegevens over het hele EEG-signaal, terwijl test spectrogrammen korter zijn en zich richten op een specifiek segment van het signaal. Dit verschil beïnvloedt hoe de functies worden berekend, met name de selectie van het tijdvenster voor feature-extractie.
 
 
-def build_features(meta, spec_dir, is_test=False, n_jobs=-1): #n_jobs=-1 betekent dat alle beschikbare CPU-kernen worden gebruikt voor parallelle verwerking. Dit kan de verwerkingstijd aanzienlijk verkorten, vooral bij grote datasets.
+def build_features(meta, spec_dir, is_test=False, n_jobs=-1):
     """Compute features for all EEGs in `meta`, reading each spectrogram file once (in parallel)."""
     t0 = time.time()
     if is_test:   # test.csv has no label offsets
@@ -158,8 +150,9 @@ def build_features(meta, spec_dir, is_test=False, n_jobs=-1): #n_jobs=-1 beteken
     print(f"{len(jobs)} spectrograms -> {len(out)} feature rows in {time.time() - t0:.0f}s")
     return out
 
+
 # ----------------------------------------------------------------------------- models
-def kl_score(y_true, y_pred, eps=1e-15):    #meet hoe verschillend de voorspelde kansverdeling is van de werkelijke verdeling. Een lagere KL-score duidt op een betere voorspelling.
+def kl_score(y_true, y_pred, eps=1e-15):
     """Mean KL divergence KL(y_true || y_pred) over samples, as in the competition metric."""
     p = np.clip(y_pred, eps, 1)
     p = p / p.sum(axis=1, keepdims=True)
@@ -167,7 +160,7 @@ def kl_score(y_true, y_pred, eps=1e-15):    #meet hoe verschillend de voorspelde
     return np.mean(np.sum(np.where(t > 0, t * np.log(np.where(t > 0, t, 1) / p), 0), axis=1))
 
 
-def expand(X, Y): #scikit learn classifiers typically expect hard labels (one class per sample), but in this case, the labels are soft (probability distributions over classes). The expand function transforms the soft labels into a format suitable for training by repeating each sample for each class and assigning weights based on the soft label probabilities.
+def expand(X, Y):
     """Turn soft labels into weighted hard labels.
 
     Each sample is repeated once per class (label = class index, weight = vote fraction);
@@ -179,119 +172,285 @@ def expand(X, Y): #scikit learn classifiers typically expect hard labels (one cl
     wr = Y.reshape(-1)
     keep = wr > 0
     return Xr[keep], yr[keep], wr[keep]
-#gewicht bepaalt hoeveel invloed een bepaald voorbeeld heeft op het leren van het model. Voorbeelden met hogere gewichten dragen meer bij aan de parameterupdates tijdens het trainen, terwijl voorbeelden met lagere gewichten minder invloed hebben. Dit is vooral belangrijk bij soft labels, omdat het model moet leren van de onzekerheid in de labels en niet alleen van harde beslissingen.
-class MLP(nn.Module):
-    def __init__(self, input_size=88, n_classes=6):
+
+
+class SpectrogramData:
+    """Verwijzingen naar spectrogrambestanden, zonder alles in RAM te laden."""
+    def __init__(self, meta, spec_dir):
+        self.meta = meta.reset_index(drop=True).copy()
+        self.spec_dir = Path(spec_dir)
+
+    def __len__(self):
+        return len(self.meta)
+
+    def subset(self, indices):
+        return SpectrogramData(
+            self.meta.iloc[indices].reset_index(drop=True),
+            self.spec_dir
+        )
+
+
+class HMSSpectrogramDataset(Dataset):
+    """Leest per EEG het juiste venster uit het bijbehorende spectrogram."""
+
+    def __init__(self, data, labels=None, cache_size=8):
+        self.data = data
+        self.labels = labels
+        self.cache_size = cache_size
+        self.cache = OrderedDict()
+
+    def __len__(self):
+        return len(self.data)
+
+    
+    def load_spectrogram(self, spec_id):
+    # Convert numeric spectrogram IDs to integer strings.
+        if isinstance(spec_id, (float, np.floating)) and spec_id.is_integer():
+            spec_id = str(int(spec_id))
+        else:
+            spec_id = str(spec_id)
+
+        if spec_id in self.cache:
+            self.cache.move_to_end(spec_id)
+            return self.cache[spec_id]
+
+        path = self.data.spec_dir / f"{spec_id}.parquet"
+
+        spec = pd.read_parquet(path)
+        values = spec.iloc[:, 1:].to_numpy(dtype=np.float32)
+
+        self.cache[spec_id] = values
+
+        if len(self.cache) > self.cache_size:
+            self.cache.popitem(last=False)
+
+        return values
+
+
+    def __getitem__(self, idx):
+        row = self.data.meta.iloc[idx]
+        spec = self.load_spectrogram(row["spectrogram_id"])
+
+        # Trainingsdata: selecteer het venster rond de label-offsets.
+        if "off_min" in row.index and "off_max" in row.index:
+            start = int((row["off_min"] + row["off_max"]) // 4)
+        else:
+            # Testdata: neem het middelste venster.
+            start = max(0, (len(spec) - 300) // 2)
+
+        start = min(start, max(0, len(spec) - 300))
+        window = spec[start:start + 300]
+
+        # Maak elk venster exact 300 tijdstappen lang.
+        if len(window) < 300:
+            padding = np.zeros(
+                (300 - len(window), spec.shape[1]),
+                dtype=np.float32
+            )
+            window = np.concatenate([window, padding], axis=0)
+
+        # Logtransformatie en behandeling van ontbrekende waarden.
+        window = np.nan_to_num(
+            window, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        window = np.log1p(np.maximum(window, 0.0))
+
+        # Normalisatie per spectrogramsegment.
+        mean = window.mean()
+        std = window.std()
+        window = (window - mean) / (std + 1e-6)
+
+        # CNN verwacht [channels, height, width].
+        x = torch.from_numpy(
+            np.ascontiguousarray(window)
+        ).float().unsqueeze(0)
+
+        if self.labels is None:
+            return x
+
+        y = torch.tensor(self.labels[idx], dtype=torch.float32)
+        return x, y
+
+
+class HMSConvNet(nn.Module):
+    """2D convolutional neural network voor EEG-spectrogrammen."""
+
+    def __init__(self, n_classes=6):
         super().__init__()
 
-        self.network = nn.Sequential(
-            nn.Linear(input_size, 128),
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
 
-            nn.Linear(128, 64),
-            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 4))
+        )
 
-            nn.Linear(64, n_classes)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 4 * 4, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes)
         )
 
     def forward(self, x):
-        return self.network(x)
+        x = self.features(x)
+        return self.classifier(x)
 
-class SoftLabelMLP:
-    def __init__(self, input_size=88, n_classes=6,
-                 lr=0.001, epochs=100, batch_size=32):
 
-        torch.manual_seed(42)
-        np.random.seed(42)
+class SoftLabelCNN:
+    """CNN met dezelfde fit() en predict_proba() interface als sklearn."""
 
-        self.scaler = StandardScaler()
-        self.lr = lr
+    def __init__(self, epochs=4, batch_size=16, lr=0.001, seed=42):
         self.epochs = epochs
         self.batch_size = batch_size
-
-        self.model = MLP(input_size, n_classes)
-
-        self.criterion = nn.KLDivLoss(reduction="batchmean")
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=self.lr
-        )
+        self.lr = lr
+        self.seed = seed
+        self.model = None
+        self.device = torch.device("cpu")
 
     def fit(self, X, Y):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
 
-        X = self.scaler.fit_transform(X)
+        dataset = HMSSpectrogramDataset(X, labels=Y)
 
-        dataset = TensorDataset(
-            torch.tensor(X, dtype=torch.float32),
-            torch.tensor(Y, dtype=torch.float32)
-        )
-
-        dataloader = DataLoader(
+        loader = DataLoader(
             dataset,
             batch_size=self.batch_size,
-            shuffle=True
+            shuffle=True,
+            num_workers=0
+        )
+
+        self.model = HMSConvNet(n_classes=Y.shape[1]).to(self.device)
+
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.lr,
+            weight_decay=1e-4
         )
 
         self.model.train()
 
         for epoch in range(self.epochs):
-            for batch_X, batch_Y in dataloader:
-                self.optimizer.zero_grad()
+            total_loss = 0.0
+            total_samples = 0
 
-                outputs = F.log_softmax(self.model(batch_X), dim=1)
-                loss = self.criterion(outputs, batch_Y)
+            for xb, yb in loader:
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
+
+                optimizer.zero_grad()
+
+                logits = self.model(xb)
+                log_probs = F.log_softmax(logits, dim=1)
+
+                loss = F.kl_div(
+                    log_probs,
+                    yb,
+                    reduction="batchmean"
+                )
 
                 loss.backward()
-                self.optimizer.step()
+                optimizer.step()
+
+                total_loss += loss.item() * len(xb)
+                total_samples += len(xb)
+
+            print(
+                f"    CNN epoch {epoch + 1}/{self.epochs}: "
+                f"KL={total_loss / total_samples:.4f}"
+            )
 
         return self
 
     def predict_proba(self, X):
-        self.model.eval()
+        dataset = HMSSpectrogramDataset(X, labels=None)
 
-        X = self.scaler.transform(X)
-        X = torch.tensor(X, dtype=torch.float32)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+
+        self.model.eval()
+        predictions = []
 
         with torch.no_grad():
-            outputs = self.model(X)
-            probabilities = F.softmax(outputs, dim=1)
+            for xb in loader:
+                xb = xb.to(self.device)
+                probabilities = F.softmax(self.model(xb), dim=1)
+                predictions.append(probabilities.cpu().numpy())
 
-        return probabilities.numpy()
+        return np.concatenate(predictions, axis=0)
 
-    
+
+
+
 def make_model(name, seed=42):
-    """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
-        return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
+        return make_pipeline(
+            StandardScaler(),
+            LogisticRegression(C=0.1, max_iter=2000)
+        )
 
-    return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
-                                          l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
+    elif name == "hgb":
+        return HistGradientBoostingClassifier(
+            learning_rate=0.05,
+            max_iter=300,
+            max_leaf_nodes=31,
+            l2_regularization=1.0,
+            random_state=seed
+        )
+
+    elif name == "cnn":
+        return SoftLabelCNN(
+            epochs=4,
+            batch_size=16,
+            lr=0.001,
+            seed=seed
+        )
+
+    raise ValueError(f"Unknown model: {name}")
 
 
-MODEL_NAMES = ["logreg", "mlp", "hgb"]
+MODEL_NAMES = ["logreg", "hgb", "cnn"]
 
 
-def fit(name, X, Y, seed=42): #model trainen 
-    """Fit model `name` on features X and soft labels Y (rows are vote distributions)."""
-    
-    if name == "mlp":
-        model = SoftLabelMLP(
-    input_size=X.shape[1],
-    n_classes=Y.shape[1],
-    lr=0.001,
-    epochs=100,
-    batch_size=32
-)
+
+def fit(name, X, Y, seed=42):
+    model = make_model(name, seed)
+
+    if name == "cnn":
         model.fit(X, Y)
-        return model
-    
-    Xe, ye, we = expand(X, Y)
-    m = make_model(name, seed)  #soft labels uitgebreid naar gewogen observaties
-    if name == "logreg":   # in a Pipeline the weight must be routed to the final step
-        m.fit(Xe, ye, logisticregression__sample_weight=we) #model leert relatie tussen de 88 features en de zes klassen, waarbij de gewichten aangeven hoe belangrijk elk voorbeeld is bij het leren van de parameters van het model
+
     else:
-        m.fit(Xe, ye, sample_weight=we)
-    return m
+        X_expanded, y_expanded, weights = expand(X, Y)
+
+        if name == "logreg":
+            model.fit(
+                X_expanded,
+                y_expanded,
+                logisticregression__sample_weight=weights
+            )
+        else:
+            model.fit(
+                X_expanded,
+                y_expanded,
+                sample_weight=weights
+            )
+
+    return model
+
 
 
 def to_matrix(frame, feats):
@@ -299,20 +458,67 @@ def to_matrix(frame, feats):
     return np.nan_to_num(frame[feats].to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def cross_validate(X, Y, groups, num_votes, n_folds, seed):
-    """Patient-grouped K-fold CV for both models; prints scores and returns the better model's name."""
-    prior = np.tile(Y.mean(axis=0), (len(Y), 1))   # trivial reference: always predict the mean distribution. prior baseline berekend op basis van de gemiddelde verdeling van de klassen in de trainingsset. Het dient als een eenvoudige referentie om te vergelijken hoe goed de getrainde modellen presteren ten opzichte van een model dat altijd dezelfde voorspelling doet, namelijk de gemiddelde verdeling van de klassen.
-    hi = num_votes >= 10                            # EEGs with at least 10 expert votes
-    oof = {name: np.zeros_like(Y) for name in MODEL_NAMES}   # out-of-fold predictions per model
-    for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_folds).split(X, Y, groups)):  #hoe goed presteert het model op ongeziene data, waarbij de gegevens worden gegroepeerd op basis van patient_id om te voorkomen dat gegevens van dezelfde patiënt in zowel de trainings- als validatiesets terechtkomen
+def cross_validate(X, X_spectrograms, Y, groups, num_votes,
+                   n_folds, seed):
+
+    prior = np.tile(Y.mean(axis=0), (len(Y), 1))
+    hi = num_votes >= 10
+
+    oof = {
+        name: np.zeros_like(Y)
+        for name in MODEL_NAMES
+    }
+
+    splitter = GroupKFold(n_splits=n_folds)
+
+    for fold, (tr, va) in enumerate(
+        splitter.split(X, Y, groups)
+    ):
+        print(f"\nfold {fold}")
+
         for name in MODEL_NAMES:
-            oof[name][va] = fit(name, X[tr], Y[tr], seed).predict_proba(X[va])
-        print(f"fold {fold}: " + ", ".join(f"{n}={kl_score(Y[va], oof[n][va]):.4f}" for n in MODEL_NAMES))
-    print(f"\nCV KL (all EEGs)        prior={kl_score(Y, prior):.4f} " +
-          " ".join(f"{n}={kl_score(Y, oof[n]):.4f}" for n in MODEL_NAMES))
-    print(f"CV KL (>=10 votes only) prior={kl_score(Y[hi], prior[hi]):.4f} " +
-          " ".join(f"{n}={kl_score(Y[hi], oof[n][hi]):.4f}" for n in MODEL_NAMES))
-    return min(MODEL_NAMES, key=lambda n: kl_score(Y, oof[n]))   # lower KL is better
+
+            if name == "cnn":
+                # CNN gebruikt de spectrogrammen.
+                X_train = X_spectrograms.subset(tr)
+                X_valid = X_spectrograms.subset(va)
+
+            else:
+                # LogReg en HGB gebruiken de 88 features.
+                X_train = X[tr]
+                X_valid = X[va]
+
+            model = fit(name, X_train, Y[tr], seed + fold)
+
+            oof[name][va] = model.predict_proba(X_valid)
+
+        print(
+            "  " + ", ".join(
+                f"{name}={kl_score(Y[va], oof[name][va]):.4f}"
+                for name in MODEL_NAMES
+            )
+        )
+
+    print(
+        f"\nCV KL (all EEGs) prior={kl_score(Y, prior):.4f} "
+        + " ".join(
+            f"{name}={kl_score(Y, oof[name]):.4f}"
+            for name in MODEL_NAMES
+        )
+    )
+
+    print(
+        f"\nCV KL (>=10 votes only) prior={kl_score(Y[hi], prior[hi]):.4f} "
+        + " ".join(
+            f"{name}={kl_score(Y[hi], oof[name][hi]):.4f}"
+            for name in MODEL_NAMES
+        )
+    )
+
+    return min(
+        MODEL_NAMES,
+        key=lambda name: kl_score(Y, oof[name])
+    )
 
 
 # ----------------------------------------------------------------------------- main
@@ -340,20 +546,71 @@ def main():
     print(len(feats), "features")
     X = to_matrix(df, feats)
     Y = df[CLASSES].to_numpy()
+    # Spectrogramverwijzingen voor de CNN.
+    # De bestanden worden pas tijdens training en voorspelling ingelezen.
+    X_spectrograms = SpectrogramData(
+        df,
+        args.data_dir / "train_spectrograms"
+    )
 
     # 3. Cross-validation and model choice
     if args.no_cv:
         best = "hgb"
     else:
-        best = cross_validate(X, Y, df["patient_id"].to_numpy(), df["num_votes"].to_numpy(),
-                              args.folds, args.seed)    #model met de laagste KL-score wordt gekozen als het beste model
+        best = cross_validate(
+                        X,
+                        X_spectrograms,
+                        Y,
+                        df["patient_id"].to_numpy(),
+                        df["num_votes"].to_numpy(),
+                        args.folds,
+                        args.seed
+                    )
     print("model for submission:", best)
 
     # 4. Refit on all training data and predict the test set
-    final = fit(best, X, Y, args.seed)  #gekozen model wordt opnieuw getraind op alle trainingsgegevens om de uiteindelijke voorspellingen te maken. nu de volledige trianingsset dus ook dubbele patienten en EEGs met minder dan 10 stemmen worden gebruikt om het model te trainen, zodat het kan profiteren van alle beschikbare informatie en mogelijk betere voorspellingen kan doen op de testset.
+    
+    # 4. Refit on all training data and predict the test set.
     test = pd.read_csv(args.data_dir / "test.csv")
-    T_df = build_features(test, args.data_dir / "test_spectrograms", is_test=True, n_jobs=args.n_jobs)
-    T_df = test[["eeg_id"]].merge(T_df, on="eeg_id", how="left")   # keep the order of test.csv
+
+    if best == "cnn":
+        # CNN gebruikt rechtstreeks de test-spectrogrammen.
+        X_test = SpectrogramData(
+            test,
+            args.data_dir / "test_spectrograms"
+        )
+
+        final = fit("cnn", X_spectrograms, Y, args.seed)
+        predictions = final.predict_proba(X_test)
+
+        sub = pd.DataFrame({"eeg_id": test["eeg_id"]})
+        sub[CLASSES] = predictions
+
+    else:
+        # Bestaande pipeline voor LogReg en HGB blijft behouden.
+        final = fit(best, X, Y, args.seed)
+
+        T_df = build_features(
+            test,
+            args.data_dir / "test_spectrograms",
+            is_test=True,
+            n_jobs=args.n_jobs
+        )
+
+        T_df = test[["eeg_id"]].merge(
+            T_df,
+            on="eeg_id",
+            how="left"
+        )
+
+        sub = pd.DataFrame({"eeg_id": T_df["eeg_id"]})
+        sub[CLASSES] = final.predict_proba(
+            to_matrix(T_df, feats)
+        )
+
+    sub.to_csv(args.output, index=False)
+    print(f"Saved {args.output} with {len(sub)} rows")
+
 
     # Submission format: eeg_id plus one predicted probability per class (each row sums to 1).
     sub = pd.DataFrame({"eeg_id": T_df["eeg_id"]})
