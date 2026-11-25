@@ -5,3 +5,6 @@ __pycache__/
 submission.csv
 .ipynb_checkpoints/
 .DS_Store
+
+# CatBoost training logs
+catboost_info/
