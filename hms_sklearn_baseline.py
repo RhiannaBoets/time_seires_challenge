@@ -34,6 +34,8 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import ExtraTreesClassifier
 
+from catboost import CatBoostClassifier
+
 # Some spectrograms contain frequency bands that are entirely NaN; numpy warns about the
 # resulting empty means. These cases are handled explicitly below, so the warnings are muted.
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -176,20 +178,21 @@ def make_model(name, seed=42):
     """The two candidate models. Logistic regression needs standardised features; gradient boosting does not."""
     if name == "logreg":
         return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
-    elif name == "extratrees":
-        return ExtraTreesClassifier(
-            n_estimators=200,
-            max_depth=15,
-            min_samples_leaf=5,
-            max_features="sqrt",
-            random_state=seed,
-            n_jobs=1
+    elif name == "catboost":
+        return CatBoostClassifier(
+            iterations=500,
+            depth=6,
+            learning_rate=0.05,
+            loss_function="MultiClass",
+            verbose=False,
+            random_seed=seed,
+            thread_count=2
         )
     return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
-MODEL_NAMES = ["logreg", "hgb", "extratrees"]
+MODEL_NAMES = ["logreg", "hgb", "catboost"]
 
 
 def fit(name, X, Y, seed=42): #model trainen 
