@@ -180,9 +180,10 @@ def make_model(name, seed=42):
         return make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000)) #model leert een gewogen som van de inputkenmerken en past een logistische functie toe om de kans op een bepaalde klasse te voorspellen. C bepaalt de sterkte van de regularisatie, waarbij een lagere waarde meer regularisatie betekent en overfitting kan helpen voorkomen
     elif name == "catboost":
         return CatBoostClassifier(
-            iterations=500,
+            iterations=1000,
             depth=6,
             learning_rate=0.05,
+            l2_leaf_reg=5,  # deze waarde gaan we aanpassen
             loss_function="MultiClass",
             verbose=False,
             random_seed=seed,
