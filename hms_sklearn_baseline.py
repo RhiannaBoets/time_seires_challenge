@@ -35,6 +35,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import ExtraTreesClassifier
 
 from catboost import CatBoostClassifier
+from xgboost import XGBClassifier
 
 # Some spectrograms contain frequency bands that are entirely NaN; numpy warns about the
 # resulting empty means. These cases are handled explicitly below, so the warnings are muted.
@@ -189,11 +190,14 @@ def make_model(name, seed=42):
             random_seed=seed,
             thread_count=2
         )
+    elif name == "xgboost":
+        return XGBClassifier(learning_rate=0.05, n_estimators=300, max_depth=6, subsample=0.8,
+                             colsample_bytree=0.8, random_state=seed)
     return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
                                           l2_regularization=1.0, random_state=seed) #bouwt reeks van beslisbomen op, waarbij elke boom wordt getraind om de fouten van de vorige bomen te corrigeren. Het model combineert de voorspellingen van alle bomen om een uiteindelijke voorspelling te maken. De hyperparameters zoals learning_rate, max_iter, max_leaf_nodes en l2_regularization beïnvloeden de complexiteit en prestaties van het model.
 
 
-MODEL_NAMES = ["logreg", "hgb", "catboost"]
+MODEL_NAMES = ["logreg", "hgb", "catboost", "xgboost"]
 
 
 def fit(name, X, Y, seed=42): #model trainen 
@@ -212,20 +216,87 @@ def to_matrix(frame, feats):
     return np.nan_to_num(frame[feats].to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
+
 def cross_validate(X, Y, groups, num_votes, n_folds, seed):
-    """Patient-grouped K-fold CV for both models; prints scores and returns the better model's name."""
-    prior = np.tile(Y.mean(axis=0), (len(Y), 1))   # trivial reference: always predict the mean distribution. prior baseline berekend op basis van de gemiddelde verdeling van de klassen in de trainingsset. Het dient als een eenvoudige referentie om te vergelijken hoe goed de getrainde modellen presteren ten opzichte van een model dat altijd dezelfde voorspelling doet, namelijk de gemiddelde verdeling van de klassen.
-    hi = num_votes >= 10                            # EEGs with at least 10 expert votes
-    oof = {name: np.zeros_like(Y) for name in MODEL_NAMES}   # out-of-fold predictions per model
-    for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_folds).split(X, Y, groups)):  #hoe goed presteert het model op ongeziene data, waarbij de gegevens worden gegroepeerd op basis van patient_id om te voorkomen dat gegevens van dezelfde patiënt in zowel de trainings- als validatiesets terechtkomen
+    """Patient-grouped CV and evaluation of CatBoost/XGBoost ensembles."""
+
+    prior = np.tile(Y.mean(axis=0), (len(Y), 1))
+    hi = num_votes >= 10
+
+    oof = {
+        name: np.zeros_like(Y)
+        for name in MODEL_NAMES
+    }
+
+    for fold, (tr, va) in enumerate(
+        GroupKFold(n_splits=n_folds).split(X, Y, groups)
+    ):
         for name in MODEL_NAMES:
-            oof[name][va] = fit(name, X[tr], Y[tr], seed).predict_proba(X[va])
-        print(f"fold {fold}: " + ", ".join(f"{n}={kl_score(Y[va], oof[n][va]):.4f}" for n in MODEL_NAMES))
-    print(f"\nCV KL (all EEGs)        prior={kl_score(Y, prior):.4f} " +
-          " ".join(f"{n}={kl_score(Y, oof[n]):.4f}" for n in MODEL_NAMES))
-    print(f"CV KL (>=10 votes only) prior={kl_score(Y[hi], prior[hi]):.4f} " +
-          " ".join(f"{n}={kl_score(Y[hi], oof[n][hi]):.4f}" for n in MODEL_NAMES))
-    return min(MODEL_NAMES, key=lambda n: kl_score(Y, oof[n]))   # lower KL is better
+            model = fit(name, X[tr], Y[tr], seed)
+            oof[name][va] = model.predict_proba(X[va])
+
+        print(
+            f"fold {fold}: "
+            + ", ".join(
+                f"{name}={kl_score(Y[va], oof[name][va]):.4f}"
+                for name in MODEL_NAMES
+            )
+        )
+
+    # Individual model results
+    print("\nCV KL (all EEGs)")
+    for name in MODEL_NAMES:
+        print(f"{name}: {kl_score(Y, oof[name]):.4f}")
+
+    print("\nCV KL (>=10 votes only)")
+    for name in MODEL_NAMES:
+        print(f"{name}: {kl_score(Y[hi], oof[name][hi]):.4f}")
+
+    # Combine CatBoost and XGBoost predictions.
+    cat_pred = oof["catboost"]
+    xgb_pred = oof["xgboost"]
+
+    weights = [0.0, 0.25, 0.5, 0.7, 0.8, 1.0]
+
+    print("\nEnsemble results (weight = CatBoost)")
+    ensemble_results = {}
+
+    for weight in weights:
+        pred = weight * cat_pred + (1 - weight) * xgb_pred
+
+        score_all = kl_score(Y, pred)
+        score_hi = kl_score(Y[hi], pred[hi])
+
+        ensemble_results[weight] = score_all
+
+        print(
+            f"CatBoost {weight:.0%} + XGBoost "
+            f"{1-weight:.0%}: "
+            f"all={score_all:.4f}, >=10 votes={score_hi:.4f}"
+        )
+
+    # Select the best individual model or ensemble.
+    individual_scores = {
+        name: kl_score(Y, oof[name])
+        for name in MODEL_NAMES
+    }
+
+    best_name = min(individual_scores, key=individual_scores.get)
+    best_score = individual_scores[best_name]
+    best_weight = None
+
+    for weight, score in ensemble_results.items():
+        if score < best_score:
+            best_score = score
+            best_name = "ensemble"
+            best_weight = weight
+
+    print(f"\nBest model: {best_name}")
+    if best_name == "ensemble":
+        print(f"Best CatBoost weight: {best_weight:.0%}")
+
+    return best_name, best_weight
+
 
 
 # ----------------------------------------------------------------------------- main
@@ -254,25 +325,62 @@ def main():
     X = to_matrix(df, feats)
     Y = df[CLASSES].to_numpy()
 
+    
     # 3. Cross-validation and model choice
     if args.no_cv:
-        best = "hgb"
+        best = "catboost"
+        best_weight = None
     else:
-        best = cross_validate(X, Y, df["patient_id"].to_numpy(), df["num_votes"].to_numpy(),
-                              args.folds, args.seed)    #model met de laagste KL-score wordt gekozen als het beste model
+        best, best_weight = cross_validate(
+            X,
+            Y,
+            df["patient_id"].to_numpy(),
+            df["num_votes"].to_numpy(),
+            args.folds,
+            args.seed
+        )
+
     print("model for submission:", best)
 
-    # 4. Refit on all training data and predict the test set
-    final = fit(best, X, Y, args.seed)  #gekozen model wordt opnieuw getraind op alle trainingsgegevens om de uiteindelijke voorspellingen te maken. nu de volledige trianingsset dus ook dubbele patienten en EEGs met minder dan 10 stemmen worden gebruikt om het model te trainen, zodat het kan profiteren van alle beschikbare informatie en mogelijk betere voorspellingen kan doen op de testset.
+    # 4. Refit on all training data and predict test set
     test = pd.read_csv(args.data_dir / "test.csv")
-    T_df = build_features(test, args.data_dir / "test_spectrograms", is_test=True, n_jobs=args.n_jobs)
-    T_df = test[["eeg_id"]].merge(T_df, on="eeg_id", how="left")   # keep the order of test.csv
 
-    # Submission format: eeg_id plus one predicted probability per class (each row sums to 1).
+    T_df = build_features(
+        test,
+        args.data_dir / "test_spectrograms",
+        is_test=True,
+        n_jobs=args.n_jobs
+    )
+
+    T_df = test[["eeg_id"]].merge(
+        T_df, on="eeg_id", how="left"
+    )
+
+    X_test = to_matrix(T_df, feats)
+
+    if best == "ensemble":
+        final_cat = fit("catboost", X, Y, args.seed)
+        final_xgb = fit("xgboost", X, Y, args.seed)
+
+        pred_cat = final_cat.predict_proba(X_test)
+        pred_xgb = final_xgb.predict_proba(X_test)
+
+        predictions = (
+            best_weight * pred_cat
+            + (1 - best_weight) * pred_xgb
+        )
+    else:
+        final = fit(best, X, Y, args.seed)
+        predictions = final.predict_proba(X_test)
+
+    # 5. Create submission
     sub = pd.DataFrame({"eeg_id": T_df["eeg_id"]})
-    sub[CLASSES] = final.predict_proba(to_matrix(T_df, feats))
+    sub[CLASSES] = predictions
+
     sub.to_csv(args.output, index=False)
+
     print(f"Saved {args.output} with {len(sub)} rows")
+
 
 
 if __name__ == "__main__":   # required for parallel workers on macOS and Windows
