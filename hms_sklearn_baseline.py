@@ -255,6 +255,47 @@ def inspect_spectrogram_timing(data_dir):
         )
 
 
+def inspect_one_eeg(data_dir, eeg_id):
+    train = pd.read_csv(data_dir / "train.csv")
+
+    rows = train[train["eeg_id"] == eeg_id].copy()
+
+    print("\n--- SELECTED EEG ---")
+    print(
+        rows[
+            [
+                "eeg_id",
+                "eeg_sub_id",
+                "eeg_label_offset_seconds",
+                "spectrogram_id",
+                "spectrogram_sub_id",
+                "spectrogram_label_offset_seconds",
+                "label_id",
+            ]
+        ].to_string(index=False)
+    )
+
+    sid = int(rows["spectrogram_id"].iloc[0])
+    path = data_dir / "train_spectrograms" / f"{sid}.parquet"
+    spec = pd.read_parquet(path)
+
+    print("\n--- MATCHING SPECTROGRAM ---")
+    print("Spectrogram ID:", sid)
+    print("Shape:", spec.shape)
+    print("Time values:", spec.iloc[:, 0].head(5).tolist())
+    print("Last time values:", spec.iloc[:, 0].tail(5).tolist())
+
+    for _, row in rows.iterrows():
+        offset = row["spectrogram_label_offset_seconds"]
+        start = int(offset // 2)
+
+        print(
+            f"label_id={row['label_id']}, "
+            f"offset={offset}, "
+            f"candidate start row={start}, "
+            f"candidate end row={start + 300}"
+        )
+
 # ----------------------------------------------------------------------------- main
 def main():
     parser = argparse.ArgumentParser(description="HMS simple scikit-learn baseline")
