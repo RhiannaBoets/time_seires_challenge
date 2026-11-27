@@ -37,6 +37,7 @@ from sklearn.ensemble import ExtraTreesClassifier
 from catboost import CatBoostClassifier
 from xgboost import XGBClassifier
 
+
 # Some spectrograms contain frequency bands that are entirely NaN; numpy warns about the
 # resulting empty means. These cases are handled explicitly below, so the warnings are muted.
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -300,88 +301,304 @@ def cross_validate(X, Y, groups, num_votes, n_folds, seed):
 
 
 # ----------------------------------------------------------------------------- main
+
 def main():
-    parser = argparse.ArgumentParser(description="HMS simple scikit-learn baseline")
-    parser.add_argument("--data-dir", type=Path, required=True,
-                        help="folder that contains train.csv, test.csv, train_spectrograms/ and test_spectrograms/")
-    parser.add_argument("--mode", choices=["full", "quick"], default="full",
-                        help="full: all training spectrograms; quick: a random 3,000 for a fast check")
-    parser.add_argument("--no-cv", action="store_true", help="skip cross-validation and use gradient boosting")
-    parser.add_argument("--folds", type=int, default=5, help="number of cross-validation folds")
-    parser.add_argument("--n-jobs", type=int, default=-1, help="CPU cores for reading spectrograms (-1 = all)")
-    parser.add_argument("--output", type=Path, default=Path("submission.csv"), help="where to write predictions")
-    parser.add_argument("--seed", type=int, default=42)
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data/hms")
+    )
+
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=5
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42
+    )
+
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=2
+    )
+
+    parser.add_argument(
+        "--eeg-features",
+        type=Path,
+        default=Path("eeg_features_train.csv")
+    )
+
     args = parser.parse_args()
 
-    # 1. Labels
-    df = load_labels(args.data_dir, max_specs=3000 if args.mode == "quick" else None, seed=args.seed)
-    print(df.shape, "EEGs from", df.patient_id.nunique(), "patients,", df.spectrogram_id.nunique(), "spectrograms")
+    # --------------------------------------------------
+    # 1. Labels inlezen
+    # --------------------------------------------------
 
-    # 2. Features
-    X_df = build_features(df, args.data_dir / "train_spectrograms", n_jobs=args.n_jobs)
-    df = df.merge(X_df, on="eeg_id")
-    feats = [c for c in X_df.columns if c != "eeg_id"]
-    print(len(feats), "features")
-    X = to_matrix(df, feats)
-    Y = df[CLASSES].to_numpy()
+    print("\n1. Labels inlezen...")
 
-    
-    # 3. Cross-validation and model choice
-    if args.no_cv:
-        best = "catboost"
-        best_weight = None
-    else:
-        best, best_weight = cross_validate(
-            X,
-            Y,
-            df["patient_id"].to_numpy(),
-            df["num_votes"].to_numpy(),
-            args.folds,
-            args.seed
-        )
+    meta = load_labels(
+        args.data_dir,
+        seed=args.seed
+    )
 
-    print("model for submission:", best)
+    print("Aantal EEG's:", len(meta))
+    print("Aantal patiënten:", meta.patient_id.nunique())
 
-    # 4. Refit on all training data and predict test set
-    test = pd.read_csv(args.data_dir / "test.csv")
+    # --------------------------------------------------
+    # 2. Officiële spectrogramfeatures berekenen
+    # --------------------------------------------------
 
-    T_df = build_features(
-        test,
-        args.data_dir / "test_spectrograms",
-        is_test=True,
+    print("\n2. Officiële spectrogramfeatures berekenen...")
+
+    official = build_features(
+        meta,
+        args.data_dir / "train_spectrograms",
+        is_test=False,
         n_jobs=args.n_jobs
     )
 
-    T_df = test[["eeg_id"]].merge(
-        T_df, on="eeg_id", how="left"
+    official_count = len([
+        c for c in official.columns if c != "eeg_id"
+    ])
+
+    print("Aantal officiële features:", official_count)
+
+    # --------------------------------------------------
+    # 3. Nieuwe EEG-features inlezen
+    # --------------------------------------------------
+
+    print("\n3. Nieuwe EEG-features inlezen...")
+
+    eeg = pd.read_csv(args.eeg_features)
+
+    if "eeg_id" not in eeg.columns:
+        raise ValueError("eeg_id ontbreekt in EEG-featurebestand")
+
+    if eeg["eeg_id"].duplicated().any():
+        raise ValueError("Dubbele EEG-ID's gevonden")
+
+    # ID-types gelijk maken
+    meta["eeg_id"] = meta["eeg_id"].astype("int64")
+    official["eeg_id"] = official["eeg_id"].astype("int64")
+    eeg["eeg_id"] = eeg["eeg_id"].astype("int64")
+
+    eeg_feature_cols = [
+        c for c in eeg.columns if c != "eeg_id"
+    ]
+
+    print("Aantal nieuwe EEG-features:", len(eeg_feature_cols))
+
+    # Controleren of alle trainings-EEG's aanwezig zijn
+    missing_ids = set(meta.eeg_id) - set(eeg.eeg_id)
+
+    print("Ontbrekende EEG-ID's:", len(missing_ids))
+
+    if missing_ids:
+        raise ValueError(
+            "Niet alle trainings-EEG's hebben EEG-features."
+        )
+
+    # --------------------------------------------------
+    # 4. Featuretabellen samenvoegen
+    # --------------------------------------------------
+
+    print("\n4. Featuretabellen samenvoegen...")
+
+    frame = meta.merge(
+        official,
+        on="eeg_id",
+        how="left",
+        validate="one_to_one"
     )
 
-    X_test = to_matrix(T_df, feats)
+    frame = frame.merge(
+        eeg[["eeg_id"] + eeg_feature_cols],
+        on="eeg_id",
+        how="left",
+        validate="one_to_one"
+    )
 
-    if best == "ensemble":
-        final_cat = fit("catboost", X, Y, args.seed)
-        final_hgb = fit("hgb", X, Y, args.seed)
+    official_cols = [
+        c for c in official.columns if c != "eeg_id"
+    ]
 
-        pred_cat = final_cat.predict_proba(X_test)
-        pred_hgb = final_hgb.predict_proba(X_test)
+    feature_cols = official_cols + eeg_feature_cols
 
-        predictions = (
-            best_weight * pred_cat
-            + (1 - best_weight) * pred_hgb
+    if len(feature_cols) != len(set(feature_cols)):
+        raise ValueError("Dubbele featurekolommen gevonden")
+
+    missing_values = frame[feature_cols].isna().sum().sum()
+
+    print("Officiële features:", len(official_cols))
+    print("Nieuwe EEG-features:", len(eeg_feature_cols))
+    print("Totaal features:", len(feature_cols))
+    print("Gecombineerde tabel:", frame.shape)
+    print("Ontbrekende waarden:", missing_values)
+
+    if missing_values:
+        raise ValueError(
+            "Ontbrekende waarden gevonden. Training afgebroken."
         )
-    else:
-        final = fit(best, X, Y, args.seed)
-        predictions = final.predict_proba(X_test)
 
-    # 5. Create submission
-    sub = pd.DataFrame({"eeg_id": T_df["eeg_id"]})
-    sub[CLASSES] = predictions
+    # --------------------------------------------------
+    # 5. Modeldata voorbereiden
+    # --------------------------------------------------
 
-    sub.to_csv(args.output, index=False)
+    print("\n5. Modeldata voorbereiden...")
 
-    print(f"Saved {args.output} with {len(sub)} rows")
+    X = to_matrix(frame, feature_cols)
+
+    Y = frame[CLASSES].to_numpy(dtype=np.float32)
+
+    groups = frame["patient_id"].to_numpy()
+
+    num_votes = frame["num_votes"].to_numpy()
+
+    high_vote = num_votes >= 10
+
+    print("X shape:", X.shape)
+    print("Y shape:", Y.shape)
+
+    # --------------------------------------------------
+    # 6. 5-fold GroupKFold
+    # --------------------------------------------------
+
+    print("\n6. Cross-validation starten...")
+
+    oof_cat = np.zeros_like(Y, dtype=np.float64)
+    oof_hgb = np.zeros_like(Y, dtype=np.float64)
+
+    splitter = GroupKFold(n_splits=args.folds)
+
+    for fold, (train_idx, valid_idx) in enumerate(
+        splitter.split(X, Y, groups),
+        start=1
+    ):
+
+        print(f"\nFold {fold}/{args.folds}")
+
+        # CatBoost
+        print("CatBoost trainen...")
+
+        cat = fit(
+            "catboost",
+            X[train_idx],
+            Y[train_idx],
+            args.seed
+        )
+
+        oof_cat[valid_idx] = cat.predict_proba(
+            X[valid_idx]
+        )
+
+        # HistGradientBoosting
+        print("HGB trainen...")
+
+        hgb = fit(
+            "hgb",
+            X[train_idx],
+            Y[train_idx],
+            args.seed
+        )
+
+        oof_hgb[valid_idx] = hgb.predict_proba(
+            X[valid_idx]
+        )
+
+        print(
+            "Fold KL | "
+            f"CatBoost: {kl_score(Y[valid_idx], oof_cat[valid_idx]):.4f} | "
+            f"HGB: {kl_score(Y[valid_idx], oof_hgb[valid_idx]):.4f}"
+        )
+
+    # --------------------------------------------------
+    # 7. Individuele resultaten
+    # --------------------------------------------------
+
+    print("\n" + "=" * 50)
+    print("RESULTATEN GECOMBINEERDE FEATURES")
+    print("=" * 50)
+
+    print(
+        f"CatBoost all: {kl_score(Y, oof_cat):.4f}"
+    )
+
+    print(
+        f"HGB all:      {kl_score(Y, oof_hgb):.4f}"
+    )
+
+    print(
+        f"CatBoost >=10 votes: "
+        f"{kl_score(Y[high_vote], oof_cat[high_vote]):.4f}"
+    )
+
+    print(
+        f"HGB >=10 votes: "
+        f"{kl_score(Y[high_vote], oof_hgb[high_vote]):.4f}"
+    )
+
+    # --------------------------------------------------
+    # 8. Ensemble testen
+    # --------------------------------------------------
+
+    print("\nENSEMBLE RESULTATEN")
+
+    scores = {}
+
+    for weight in [0.0, 0.25, 0.5, 0.7, 0.8, 1.0]:
+
+        pred = (
+            weight * oof_cat
+            + (1.0 - weight) * oof_hgb
+        )
+
+        score_all = kl_score(Y, pred)
+
+        score_high = kl_score(
+            Y[high_vote],
+            pred[high_vote]
+        )
+
+        scores[weight] = score_all
+
+        print(
+            f"CatBoost {weight:.0%} + "
+            f"HGB {1-weight:.0%}: "
+            f"all={score_all:.4f}, "
+            f">=10 votes={score_high:.4f}"
+        )
+
+    best_weight = min(scores, key=scores.get)
+
+    print("\n" + "=" * 50)
+    print("BESTE ENSEMBLE")
+    print("=" * 50)
+
+    print(
+        f"CatBoost {best_weight:.0%} + "
+        f"HGB {1-best_weight:.0%}"
+    )
+
+    print(
+        f"KL-score: {scores[best_weight]:.4f}"
+    )
+
+    print("\nExperiment afgerond.")
+
+    print(
+        "\nLet op: de beste ensembleweging is geselecteerd "
+        "op dezelfde OOF-voorspellingen. De score is dus "
+        "een modelselectiescore, geen onafhankelijke testscore."
+    )
 
 
-
-if __name__ == "__main__":   # required for parallel workers on macOS and Windows
+if __name__ == "__main__":
     main()
