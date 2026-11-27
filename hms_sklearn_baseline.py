@@ -184,6 +184,7 @@ def make_model(name, seed=42):
             depth=6,
             learning_rate=0.05,
             l2_leaf_reg=5,  # deze waarde gaan we aanpassen
+            random_strength=2,
             loss_function="MultiClass",
             verbose=False,
             random_seed=seed,
