@@ -184,7 +184,6 @@ def make_model(name, seed=42):
             depth=6,
             learning_rate=0.05,
             l2_leaf_reg=5,  # deze waarde gaan we aanpassen
-            random_strength=2,
             loss_function="MultiClass",
             verbose=False,
             random_seed=seed,
@@ -227,6 +226,33 @@ def cross_validate(X, Y, groups, num_votes, n_folds, seed):
     print(f"CV KL (>=10 votes only) prior={kl_score(Y[hi], prior[hi]):.4f} " +
           " ".join(f"{n}={kl_score(Y[hi], oof[n][hi]):.4f}" for n in MODEL_NAMES))
     return min(MODEL_NAMES, key=lambda n: kl_score(Y, oof[n]))   # lower KL is better
+# ----------------------------------------------------------------------------- timeframes
+
+def inspect_spectrogram_timing(data_dir):
+    train = pd.read_csv(data_dir / "train.csv")
+
+    print("\n--- OFFSET INFORMATION ---")
+    print(train["spectrogram_label_offset_seconds"].describe())
+
+    print("\n--- EEGs WITH MULTIPLE OFFSETS ---")
+    counts = train.groupby("eeg_id")[
+        "spectrogram_label_offset_seconds"
+    ].agg(["min", "max", "count"])
+
+    print(counts[counts["count"] > 1].head(10))
+
+    print("\n--- SPECTROGRAM SHAPES ---")
+    ids = train["spectrogram_id"].drop_duplicates().head(5)
+
+    for sid in ids:
+        path = data_dir / "train_spectrograms" / f"{int(sid)}.parquet"
+        spec = pd.read_parquet(path)
+
+        print(
+            f"ID={sid}, shape={spec.shape}, "
+            f"time range=({spec.iloc[:, 0].min()}, "
+            f"{spec.iloc[:, 0].max()})"
+        )
 
 
 # ----------------------------------------------------------------------------- main
