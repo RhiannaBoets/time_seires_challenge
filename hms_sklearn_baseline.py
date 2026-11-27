@@ -218,7 +218,7 @@ def to_matrix(frame, feats):
 
 
 def cross_validate(X, Y, groups, num_votes, n_folds, seed):
-    """Patient-grouped CV and evaluation of CatBoost/XGBoost ensembles."""
+    """Patient-grouped CV and evaluation of CatBoost/HGB ensembles."""
 
     prior = np.tile(Y.mean(axis=0), (len(Y), 1))
     hi = num_votes >= 10
@@ -252,9 +252,9 @@ def cross_validate(X, Y, groups, num_votes, n_folds, seed):
     for name in MODEL_NAMES:
         print(f"{name}: {kl_score(Y[hi], oof[name][hi]):.4f}")
 
-    # Combine CatBoost and XGBoost predictions.
+    # Combine CatBoost and HGB predictions.
     cat_pred = oof["catboost"]
-    xgb_pred = oof["xgboost"]
+    hgb_pred = oof["hgb"]
 
     weights = [0.0, 0.25, 0.5, 0.7, 0.8, 1.0]
 
@@ -262,7 +262,7 @@ def cross_validate(X, Y, groups, num_votes, n_folds, seed):
     ensemble_results = {}
 
     for weight in weights:
-        pred = weight * cat_pred + (1 - weight) * xgb_pred
+        pred = weight * cat_pred + (1 - weight) * hgb_pred
 
         score_all = kl_score(Y, pred)
         score_hi = kl_score(Y[hi], pred[hi])
@@ -270,7 +270,7 @@ def cross_validate(X, Y, groups, num_votes, n_folds, seed):
         ensemble_results[weight] = score_all
 
         print(
-            f"CatBoost {weight:.0%} + XGBoost "
+            f"CatBoost {weight:.0%} + HGB {1-weight:.0%}: "
             f"{1-weight:.0%}: "
             f"all={score_all:.4f}, >=10 votes={score_hi:.4f}"
         )
@@ -360,14 +360,14 @@ def main():
 
     if best == "ensemble":
         final_cat = fit("catboost", X, Y, args.seed)
-        final_xgb = fit("xgboost", X, Y, args.seed)
+        final_hgb = fit("hgb", X, Y, args.seed)
 
         pred_cat = final_cat.predict_proba(X_test)
-        pred_xgb = final_xgb.predict_proba(X_test)
+        pred_hgb = final_hgb.predict_proba(X_test)
 
         predictions = (
             best_weight * pred_cat
-            + (1 - best_weight) * pred_xgb
+            + (1 - best_weight) * pred_hgb
         )
     else:
         final = fit(best, X, Y, args.seed)
