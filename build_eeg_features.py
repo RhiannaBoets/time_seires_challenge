@@ -7,9 +7,9 @@ from eeg_spectrogram_test import (
 )
 
 # Mappen
-EEG_PATH = Path("data/hms/train_eegs")
-OUTPUT_PATH = Path("eeg_features_train.csv")
-ERROR_PATH = Path("eeg_feature_errors.csv")
+EEG_PATH = Path("data/hms/test_eegs")
+OUTPUT_PATH = Path("eeg_features_test.csv")
+ERROR_PATH = Path("eeg_feature_errors_test.csv")
  
 # Eerst 10 bestanden testen.
 # Zet later op None om alle bestanden te verwerken.

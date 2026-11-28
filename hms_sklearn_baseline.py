@@ -454,17 +454,21 @@ def main():
 
     print("\n5. Modeldata voorbereiden...")
 
+    # Alle 376 features
     X = to_matrix(frame, feature_cols)
+
+    # Alleen de oorspronkelijke 88 officiële features
+    X_official = to_matrix(frame, official_cols)
 
     Y = frame[CLASSES].to_numpy(dtype=np.float32)
 
     groups = frame["patient_id"].to_numpy()
-
     num_votes = frame["num_votes"].to_numpy()
 
     high_vote = num_votes >= 10
 
-    print("X shape:", X.shape)
+    print("X shape (376 features):", X.shape)
+    print("X_official shape (88 features):", X_official.shape)
     print("Y shape:", Y.shape)
 
     # --------------------------------------------------
@@ -473,8 +477,13 @@ def main():
 
     print("\n6. Cross-validation starten...")
 
+    # OOF-voorspellingen met alle 376 features
     oof_cat = np.zeros_like(Y, dtype=np.float64)
     oof_hgb = np.zeros_like(Y, dtype=np.float64)
+
+    # OOF-voorspellingen met alleen de oorspronkelijke 88 features
+    oof_cat_base = np.zeros_like(Y, dtype=np.float64)
+    oof_hgb_base = np.zeros_like(Y, dtype=np.float64)
 
     splitter = GroupKFold(n_splits=args.folds)
 
@@ -512,7 +521,32 @@ def main():
         oof_hgb[valid_idx] = hgb.predict_proba(
             X[valid_idx]
         )
+        # Baseline: alleen de oorspronkelijke 88 features
+        print("Baseline CatBoost (88 features) trainen...")
 
+        cat_base = fit(
+            "catboost",
+            X_official[train_idx],
+            Y[train_idx],
+            args.seed
+        )
+
+        oof_cat_base[valid_idx] = cat_base.predict_proba(
+            X_official[valid_idx]
+        )
+
+        print("Baseline HGB (88 features) trainen...")
+
+        hgb_base = fit(
+            "hgb",
+            X_official[train_idx],
+            Y[train_idx],
+            args.seed
+        )
+
+        oof_hgb_base[valid_idx] = hgb_base.predict_proba(
+            X_official[valid_idx]
+        )
         print(
             "Fold KL | "
             f"CatBoost: {kl_score(Y[valid_idx], oof_cat[valid_idx]):.4f} | "
@@ -590,8 +624,158 @@ def main():
     print(
         f"KL-score: {scores[best_weight]:.4f}"
     )
+    # --------------------------------------------------
+    # 9. Eerlijke vergelijking: 88 versus 376 features
+    # --------------------------------------------------
 
-    print("\nExperiment afgerond.")
+    print("\n" + "=" * 55)
+    print("VERGELIJKING: 88 VERSUS 376 FEATURES")
+    print("=" * 55)
+
+    baseline_ensemble = (
+        0.70 * oof_cat_base
+        + 0.30 * oof_hgb_base
+    )
+
+    combined_ensemble = (
+        0.70 * oof_cat
+        + 0.30 * oof_hgb
+    )
+
+    baseline_score = kl_score(Y, baseline_ensemble)
+    combined_score = kl_score(Y, combined_ensemble)
+
+    print(f"Baseline (88 features):  {baseline_score:.4f}")
+    print(f"Nieuw (376 features):    {combined_score:.4f}")
+    print(f"Verbetering:              {baseline_score - combined_score:.4f}")
+
+
+    # --------------------------------------------------
+    # 10. Testfeatures berekenen en samenvoegen
+    # --------------------------------------------------
+
+    print("\n10. Testfeatures berekenen...")
+
+    test = pd.read_csv(args.data_dir / "test.csv")
+
+    test_meta = (
+        test[["eeg_id", "spectrogram_id"]]
+        .drop_duplicates("eeg_id")
+        .reset_index(drop=True)
+    )
+
+    test_official = build_features(
+        test_meta,
+        args.data_dir / "test_spectrograms",
+        is_test=True,
+        n_jobs=args.n_jobs
+    )
+
+    eeg_test = pd.read_csv("eeg_features_test.csv")
+
+    test_meta["eeg_id"] = test_meta["eeg_id"].astype("int64")
+    test_official["eeg_id"] = test_official["eeg_id"].astype("int64")
+    eeg_test["eeg_id"] = eeg_test["eeg_id"].astype("int64")
+
+    if eeg_test["eeg_id"].duplicated().any():
+        raise ValueError("Dubbele EEG-ID's in testfeatures.")
+
+    missing_test_ids = set(test_meta.eeg_id) - set(eeg_test.eeg_id)
+
+    if missing_test_ids:
+        raise ValueError(
+            f"{len(missing_test_ids)} test-EEG's missen EEG-features."
+        )
+
+    test_frame = test_meta.merge(
+        test_official,
+        on="eeg_id",
+        how="left",
+        validate="one_to_one"
+    )
+
+    test_frame = test_frame.merge(
+        eeg_test,
+        on="eeg_id",
+        how="left",
+        validate="one_to_one"
+    )
+
+    test_feature_cols = official_cols + eeg_feature_cols
+
+    if list(test_feature_cols) != list(feature_cols):
+        raise ValueError("Train- en testfeaturekolommen komen niet overeen.")
+
+    if test_frame[test_feature_cols].isna().sum().sum() > 0:
+        raise ValueError("Ontbrekende waarden in testfeatures.")
+
+    X_test = to_matrix(test_frame, feature_cols)
+
+    print("Testfeatures:", X_test.shape)
+
+    # --------------------------------------------------
+    # 11. Modellen trainen op alle trainingsdata
+    # --------------------------------------------------
+
+    print("\n11. Definitieve modellen trainen...")
+
+    final_cat = fit(
+        "catboost",
+        X,
+        Y,
+        args.seed
+    )
+
+    final_hgb = fit(
+        "hgb",
+        X,
+        Y,
+        args.seed
+    )
+
+    # --------------------------------------------------
+    # 12. Voorspellingen combineren
+    # --------------------------------------------------
+
+    print("\n12. Testvoorspellingen maken...")
+
+    pred_cat = final_cat.predict_proba(X_test)
+    pred_hgb = final_hgb.predict_proba(X_test)
+
+    predictions = (
+        0.70 * pred_cat
+        + 0.30 * pred_hgb
+    )
+
+    predictions = predictions / predictions.sum(
+        axis=1,
+        keepdims=True
+    )
+
+    # --------------------------------------------------
+    # 13. Submission opslaan
+    # --------------------------------------------------
+
+    submission = pd.DataFrame(
+        predictions,
+        columns=CLASSES
+    )
+
+    submission.insert(
+        0,
+        "eeg_id",
+        test_frame["eeg_id"].values
+    )
+
+    submission.to_csv("submission_eeg_ensemble.csv", index=False)
+
+    print("\nSubmission opgeslagen:")
+    print("submission_eeg_ensemble.csv")
+    print("Vorm:", submission.shape)
+    print(submission.head())
+
+    print("\nExperiment en submission afgerond.")
+
 
     print(
         "\nLet op: de beste ensembleweging is geselecteerd "
